@@ -237,6 +237,120 @@ def test_factory_rejects_unknown_backend(tmp_path):
         create_store("nfs", str(tmp_path / "x.db"))
 
 
+def test_legacy_fingerprints_migrate_on_open(db_path):
+    """Fingerprints written by older delimiter-based builds are rewritten on
+    upgrade, so persisted revisions/keys/package records still dedupe and
+    replay correctly afterwards."""
+    import sqlite3
+
+    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """
+CREATE TABLE events (
+    batch_id TEXT NOT NULL, revision_id TEXT NOT NULL, sensor_id TEXT NOT NULL,
+    parent_id TEXT NOT NULL, idempotency_key TEXT NOT NULL,
+    start_ns INTEGER NOT NULL, end_ns INTEGER NOT NULL, value REAL,
+    unit TEXT, withdrawn INTEGER NOT NULL,
+    PRIMARY KEY (batch_id, revision_id)) WITHOUT ROWID;
+CREATE TABLE idempotency_keys (
+    batch_id TEXT NOT NULL, idempotency_key TEXT NOT NULL,
+    revision_id TEXT NOT NULL, canonical TEXT NOT NULL,
+    PRIMARY KEY (batch_id, idempotency_key)) WITHOUT ROWID;
+CREATE TABLE seals (
+    batch_id TEXT NOT NULL, seal_id TEXT NOT NULL, timeline_hash TEXT NOT NULL,
+    evidence TEXT NOT NULL, evidence_digest TEXT NOT NULL,
+    PRIMARY KEY (batch_id, seal_id)) WITHOUT ROWID;
+CREATE TABLE packages (
+    batch_id TEXT NOT NULL, package_id TEXT NOT NULL, canonical TEXT NOT NULL,
+    response TEXT NOT NULL,
+    PRIMARY KEY (batch_id, package_id)) WITHOUT ROWID;
+        """
+    )
+
+    def legacy_event_canon(batch, sensor, rev, parent, start, end, value, unit,
+                           withdrawn):
+        value_part = "null" if value is None else repr(float(value))
+        unit_part = "null" if unit is None else unit
+        return "|".join([
+            batch, sensor, rev, parent, str(start), str(end),
+            value_part, unit_part, "1" if withdrawn else "0",
+        ])
+
+    # A revision whose field split collides under the legacy encoding:
+    # sensor "S|X" / rev "R" is indistinguishable from sensor "S" / rev "X|R".
+    sensor, rev, key = "S|X", "R", "K"
+    old_canon = legacy_event_canon("B", sensor, rev, "ROOT", 0, 10, 1.0, "C",
+                                   False)
+    conn.execute(
+        "INSERT INTO events VALUES (?,?,?,?,?,?,?,?,?,?)",
+        ("B", rev, sensor, "ROOT", key, 0, 10, 1.0, "C", 0),
+    )
+    conn.execute(
+        "INSERT INTO idempotency_keys VALUES (?,?,?,?)",
+        ("B", key, rev, old_canon),
+    )
+
+    # A package record written with the legacy newline/"=" fingerprint.
+    package_response = {
+        "batch_id": "B",
+        "package_id": "PKG1",
+        "revisions": [
+            {"sensor_id": "S|X", "revision_id": "R",
+             "idempotency_key": "K", "status": "accepted"}
+        ],
+        "result": {"timeline_hash": "first-saved"},
+    }
+    legacy_pkg_canon = f"{key}={old_canon}"
+    conn.execute(
+        "INSERT INTO packages VALUES (?,?,?,?)",
+        ("B", "PKG1", legacy_pkg_canon, json.dumps(package_response)),
+    )
+    conn.commit()
+    conn.close()
+
+    # Opening the database with the upgraded build runs the migration once.
+    upgraded = SqliteEventStore(db_path)
+
+    # Exact replay still dedupes against the persisted revision/key.
+    assert upgraded.add(_event("R", "ROOT", "K", sensor="S|X")) == "duplicate"
+    # The legacy-colliding field split is now correctly a conflict.
+    with pytest.raises(IdempotencyConflict):
+        upgraded.add(_event("X|R", "ROOT", "K", sensor="S"))
+
+    # Persisted fingerprints were rewritten to JSON form and match the new
+    # canonical builders field-for-field.
+    conn = sqlite3.connect(db_path)
+    key_canon = conn.execute(
+        "SELECT canonical FROM idempotency_keys "
+        "WHERE batch_id = ? AND idempotency_key = ?",
+        ("B", "K"),
+    ).fetchone()[0]
+    assert key_canon.startswith("[")
+    pkg_canon = conn.execute(
+        "SELECT canonical FROM packages WHERE batch_id = ? AND package_id = ?",
+        ("B", "PKG1"),
+    ).fetchone()[0]
+    conn.close()
+    assert pkg_canon.startswith("[")
+    from app.storage import canonical_package
+
+    assert pkg_canon == canonical_package(
+        [_event("R", "ROOT", "K", sensor="S|X")]
+    )
+
+    # Package replay returns the first-saved response; changed content 409s.
+    record = upgraded.get_package("B", "PKG1")
+    assert record is not None and record.canonical == pkg_canon
+    assert record.response["result"] == {"timeline_hash": "first-saved"}
+
+    # Reopening (another "restart") must be idempotent and keep behavior.
+    again = SqliteEventStore(db_path)
+    assert again.add(_event("R", "ROOT", "K", sensor="S|X")) == "duplicate"
+    with pytest.raises(IdempotencyConflict):
+        again.add(_event("X|R", "ROOT", "K", sensor="S"))
+
+
 def test_unwritable_path_is_storage_error(tmp_path):
     bad = tmp_path / "no-such-dir" / "x.db"
     # Make the parent creation fail: create the leaf path as a regular file

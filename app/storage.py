@@ -140,21 +140,38 @@ class PackageRecord:
 # ---------------------------------------------------------------------------
 
 
+def _canonical_json(value: Any) -> str:
+    """Deterministic, collision-free JSON encoding for content fingerprints.
+
+    Every field is carried as an explicitly typed JSON value, so identifiers
+    and units may freely contain the characters that used to double as
+    serialization delimiters (``|``, ``=``, newlines) without ever letting
+    two distinct payloads share a fingerprint.
+    """
+    return json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
+
+
 def canonical_event(event: StoredEvent) -> str:
-    """Canonical representation used for idempotent payload comparison."""
-    value = "null" if event.value is None else repr(float(event.value))
-    unit = "null" if event.unit is None else event.unit
-    return "|".join(
+    """Canonical representation used for idempotent payload comparison.
+
+    The idempotency key is deliberately excluded: two submissions of the same
+    revision content under different keys are the same revision (and the new
+    key is registered), while two submissions under the same key must be
+    identical field-for-field.
+    """
+    return _canonical_json(
         [
             event.batch_id,
             event.sensor_id,
             event.revision_id,
             event.parent_id,
-            str(event.start_ns),
-            str(event.end_ns),
-            value,
-            unit,
-            "1" if event.withdrawn else "0",
+            event.start_ns,
+            event.end_ns,
+            event.value,
+            event.unit,
+            event.withdrawn,
         ]
     )
 
@@ -165,13 +182,18 @@ def canonical_package(events: list[StoredEvent]) -> str:
     Every request field of every revision contributes, including each
     idempotency key: resubmitting the same revisions under different keys is
     *different* content and conflicts. The revision order inside the package
-    is normalized away, so a retry may list parents and children in any
-    order.
+    is normalized away (entries are sorted by sensor then revision id), so a
+    retry may list parents and children in any order. The nested-list JSON
+    encoding keeps the per-revision idempotency keys structurally separate,
+    so delimiter characters anywhere in an id or unit cannot collide either.
     """
-    return "\n".join(
-        f"{event.idempotency_key}={canonical_event(event)}"
-        for event in sorted(events, key=lambda e: (e.sensor_id, e.revision_id))
-    )
+    entries = [
+        [event.sensor_id, event.revision_id, event.idempotency_key,
+         canonical_event(event)]
+        for event in events
+    ]
+    entries.sort(key=lambda entry: (entry[0], entry[1]))
+    return _canonical_json(entries)
 
 
 # ---------------------------------------------------------------------------
@@ -564,10 +586,16 @@ class SqliteEventStore(BaseEventStore):
             try:
                 # executescript() issues an implicit COMMIT, which would close
                 # our BEGIN IMMEDIATE; run the DDL statements separately so
-                # the schema creation stays one atomic transaction.
+                # schema creation and the fingerprint upgrade stay one atomic
+                # transaction.
                 conn.execute("BEGIN IMMEDIATE")
                 for statement in _SCHEMA_STATEMENTS:
                     conn.execute(statement)
+                # Upgrade fingerprints written by older builds that used the
+                # ambiguous delimiter-based encoding, so revisions/idempotency
+                # keys/package records already on disk dedupe and replay
+                # correctly after the upgrade.
+                self._migrate_canonical_fingerprints(conn)
                 conn.execute("COMMIT")
             except BaseException:
                 try:
@@ -578,6 +606,101 @@ class SqliteEventStore(BaseEventStore):
             finally:
                 self._local.conn = None
                 conn.close()
+
+    def _migrate_canonical_fingerprints(self, conn: sqlite3.Connection) -> None:
+        """Rewrite legacy (delimiter-based) fingerprints into JSON form.
+
+        Old databases persisted payload fingerprints built with ``"|".join``
+        / ``"\\n".join``, which collide whenever an identifier or unit value
+        contains those delimiters. The full revision content is available in
+        the ``events`` table (nothing ever deletes individual revisions), so
+        every stored fingerprint can be recomputed field-for-field:
+
+        * ``idempotency_keys.canonical`` from the revision each key points at;
+        * ``packages.canonical`` from the package's saved revision list
+          (sensor_id/revision_id/idempotency_key plus each stored revision).
+
+        New-format fingerprints (JSON arrays) are left untouched, so the
+        migration is idempotent across restarts and concurrent workers.
+        """
+        try:
+            key_rows = conn.execute(
+                "SELECT batch_id, idempotency_key, revision_id, canonical "
+                "FROM idempotency_keys"
+            ).fetchall()
+            updates: list[tuple[str, str, str]] = []
+            for row in key_rows:
+                if _is_legacy_canonical(row["canonical"]):
+                    event_row = conn.execute(
+                        "SELECT * FROM events "
+                        "WHERE batch_id = ? AND revision_id = ?",
+                        (row["batch_id"], row["revision_id"]),
+                    ).fetchone()
+                    # Every registered key was inserted together with its
+                    # revision; skip only if the invariant was externally broken.
+                    if event_row is not None:
+                        updates.append(
+                            (
+                                canonical_event(_row_to_event(event_row)),
+                                row["batch_id"],
+                                row["idempotency_key"],
+                            )
+                        )
+            for canonical, batch_id, key in updates:
+                conn.execute(
+                    "UPDATE idempotency_keys SET canonical = ? "
+                    "WHERE batch_id = ? AND idempotency_key = ?",
+                    (canonical, batch_id, key),
+                )
+
+            pkg_rows = conn.execute(
+                "SELECT batch_id, package_id, canonical, response FROM packages"
+            ).fetchall()
+            for row in pkg_rows:
+                if not _is_legacy_package_canonical(row["canonical"]):
+                    continue
+                response = json.loads(row["response"])
+                revs: list[StoredEvent] = []
+                for item in response.get("revisions", []):
+                    event_row = conn.execute(
+                        "SELECT * FROM events "
+                        "WHERE batch_id = ? AND revision_id = ?",
+                        (row["batch_id"], item["revision_id"]),
+                    ).fetchone()
+                    if event_row is None:
+                        break
+                    stored = _row_to_event(event_row)
+                    # Rebuild the event exactly as the package submitted it:
+                    # the key mapping follows the package, not the live row.
+                    revs.append(
+                        StoredEvent(
+                            batch_id=stored.batch_id,
+                            sensor_id=stored.sensor_id,
+                            revision_id=stored.revision_id,
+                            parent_id=stored.parent_id,
+                            idempotency_key=item["idempotency_key"],
+                            start_ns=stored.start_ns,
+                            end_ns=stored.end_ns,
+                            value=stored.value,
+                            unit=stored.unit,
+                            withdrawn=stored.withdrawn,
+                        )
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE packages SET canonical = ? "
+                        "WHERE batch_id = ? AND package_id = ?",
+                        (
+                            canonical_package(revs),
+                            row["batch_id"],
+                            row["package_id"],
+                        ),
+                    )
+        except sqlite3.Error as exc:
+            raise StorageError(
+                f"failed to migrate stored fingerprints in sqlite storage at "
+                f"{self.path!r}: {exc}"
+            ) from exc
 
     # -- mutations ----------------------------------------------------------
 
@@ -875,8 +998,33 @@ class SqliteEventStore(BaseEventStore):
                 raise StorageError(f"failed to read sqlite stats: {exc}") from exc
 
 
-def _row_to_event(row: sqlite3.Row) -> StoredEvent:
-    return StoredEvent(
+def _is_legacy_canonical(canonical: str) -> bool:
+    """True for a delimiter-based revision fingerprint written by old builds.
+
+    New fingerprints are JSON arrays (begin with ``[``); legacy fingerprints
+    are the raw ``"|".join`` string, which can never parse as a JSON array.
+    """
+    if not canonical.startswith("["):
+        return True
+    try:
+        parsed = json.loads(canonical)
+    except ValueError:
+        return True
+    return not isinstance(parsed, list)
+
+
+def _is_legacy_package_canonical(canonical: str) -> bool:
+    """True for a delimiter-based package fingerprint written by old builds."""
+    if not canonical.startswith("["):
+        return True
+    try:
+        parsed = json.loads(canonical)
+    except ValueError:
+        return True
+    return not isinstance(parsed, list)
+
+
+def _row_to_event(row: sqlite3.Row) -> StoredEvent:    return StoredEvent(
         batch_id=row["batch_id"],
         sensor_id=row["sensor_id"],
         revision_id=row["revision_id"],

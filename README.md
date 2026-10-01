@@ -47,8 +47,10 @@ Compose 默认以 **2 个 uvicorn worker 进程**启动，二者通过同一个 
 停止：`Ctrl+C`（或另一终端执行 `docker compose down`）。
 
 > 依赖在镜像构建阶段安装（见 `Dockerfile`），路由、日志等初始化在进程启动时
-> 通过 FastAPI lifespan 完成，无需额外迁移步骤：SQLite 表结构在服务首次
-> 启动时自动创建（幂等 `CREATE TABLE IF NOT EXISTS`）。
+> 通过 FastAPI lifespan 完成，无需手动迁移步骤：SQLite 表结构在服务首次
+> 启动时自动创建（幂等 `CREATE TABLE IF NOT EXISTS`）；新版首次打开旧版
+> 数据库时还会在启动事务内自动把旧的分隔符拼接指纹重写为逐字段 JSON
+> 指纹（见 5b），升级幂等，重启与多 worker 并发启动都安全。
 
 ### 不用 Docker 时（本地 Python 3.11）
 
@@ -134,6 +136,10 @@ pytest -q
   - 相同 `idempotency_key` 但负载不同（或同 `revision_id` 内容不同）→ `409 Conflict`；
   - 同一 `revision_id` + 相同内容即使换了幂等键也算重复，**新键会被登记**，
     修订与键映射在同一事务内原子保存。
+  - 内容判等按**逐字段的规范化 JSON 指纹**进行：传感器/修订/父版本 ID、
+    幂等键与单位都是可含任意字符（含 `|`、`=`、换行等分隔符）的字符串，
+    判等只看字段值本身，绝不因拼接分隔符而把两条字段取值不同的修订判成
+    同一条；值区分 `null`（撤回）与数值，时间戳与撤回标记按原始类型比较。
 - **整包回传（package，见 4.1b）**：离线采集设备把同一批次的多条修订
   打包为一次原子提交。包内父子可**乱序**，所有修订先整体合并，再按同一套
   因果规则折叠；引用包外尚未上传的父版本照常列入 `gaps` 缺口。整包遵守
@@ -142,10 +148,13 @@ pytest -q
   **不写入任何内容**（同事务回滚）。成功时逐条返回 `accepted`/`duplicate`
   （与已存内容完全相同的修订按单条口径判 `duplicate`，其新键照常登记），
   并带回提交后的完整批次结果（时间线哈希与缺口）。包级幂等以
-  `(batch_id, package_id)` 为键：相同包 ID + **完全相同内容**（修订集合
-  逐字段一致，列出顺序无关）的重试返回**首次保存的结果**
+  `(batch_id, package_id)` 为键：相同包 ID + **完全相同内容**（所有修订
+  逐字段一致、每条幂等键也一致；指纹为逐字段规范化 JSON，仅忽略修订列出
+  顺序，ID/键/单位里含 `|`、`=`、换行等分隔符也不会互相误判）的重试返回
+  **首次保存的结果**
   （`status="duplicate"`，即使此后又有单条修订使批次漂移、即使发生过
-  重启）；相同包 ID 换任何内容 → `409`。包记录随修订在同一事务内落库，
+  重启）；相同包 ID 换任何内容（任一字段取值不同、换幂等键、增删修订）
+  → `409`。包记录随修订在同一事务内落库，
   多进程并发回传同一包时恰好一个 `accepted`、其余 `duplicate`。
 - **提交预览（preview，见 4.2）**：传入与提交完全相同的负载，按相同的校验、
   幂等冲突与因果折叠规则计算，但**不写入任何事件、不占用幂等键、不创建批次**。
@@ -972,7 +981,7 @@ $ curl -s localhost:8080/api/v1/batches/B42/seals/SEAL-2026-001
 后端：持久化模式为 `"sqlite"`，内存模式为 `"memory"`。
 
 ```json
-{"status": "ok", "storage": "sqlite", "version": "2.1.0"}
+{"status": "ok", "storage": "sqlite", "version": "2.2.0"}
 ```
 
 ---
@@ -984,6 +993,13 @@ $ curl -s localhost:8080/api/v1/batches/B42/seals/SEAL-2026-001
   `(batch_id, idempotency_key)`）、`seals`（封存号 → 冻结证据 JSON 与
   证据摘要，主键 `(batch_id, seal_id)`）、`packages`（包号 → 规范化内容
   指纹与首次保存的响应 JSON，主键 `(batch_id, package_id)`）。
+- `idempotency_keys.canonical` 与 `packages.canonical` 均为**逐字段规范化
+  JSON**（排序键、无空白）：前者是修订字段（不含幂等键）的定长数组，
+  后者是 `[sensor_id, revision_id, idempotency_key, 修订指纹]` 的排序列表，
+  仅忽略包内列出顺序。标识/键/单位含任意字符（包括旧实现用作分隔符的
+  `|`、`=`、换行）都不会发生跨字段误判。新版打开旧库时在启动事务内
+  自动把旧格式指纹重算重写一遍（内容均来自 `events` 全量字段），
+  升级幂等、无需人工介入。
 - 同一修订的“插入修订 + 登记幂等键”、整包回传的“逐条判定 + 整包写入 +
   保存包记录”、封存的“校验 + 冻结 + 插入封存”
   都在**单个事务**内提交，任何中途失败整体回滚，不会出现半成品状态。
@@ -1137,7 +1153,7 @@ curl -s localhost:8080/api/v1/batches/B1/result | jq .revisions_total   # -> 1
 # 同一请求在任一 worker 上重放都是 duplicate；新键重放同修订同内容登记新键
 # /health 的 storage 字段为 "sqlite"
 curl -s localhost:8080/health
-#   -> {"status":"ok","storage":"sqlite","version":"2.1.0"}
+#   -> {"status":"ok","storage":"sqlite","version":"2.2.0"}
 ```
 
 撤回某一段（墓碑，区间内被擦除）：
@@ -1152,6 +1168,111 @@ curl -s localhost:8080/health
 
 ---
 
+## 5b. 内容判等与分隔符（本轮修订）
+
+标识与单位是调用方字符串，允许包含任意字符（含 `|`、`=`、换行等）。
+本轮把单条提交、预览与整包回传使用的内容指纹从“按分隔符拼接字符串”
+改为**逐字段的规范化 JSON**：
+
+- 单条提交 / 预览：两个负载只要**任一字段取值不同**（例如
+  `sensor_id="S|X"`、`revision_id="R"` 与 `sensor_id="S"`、
+  `revision_id="X|R"`，或单位 `"C"` 与 `"C|D"`）就判为不同内容——
+  同 `idempotency_key` / 同 `revision_id` 时返回 `409`；完全相同的重试
+  仍返回原有 `duplicate`。
+- 整包：指纹只忽略**修订的列出顺序**；任一修订的任一字段不同、任一
+  幂等键变化、增删修订都算不同内容，同 `package_id` 重试返回 `409`
+  且不写入；完全相同（顺序可不同）的重试仍回放**首次保存的结果**。
+- 接口路径、状态码与响应结构均未变化：内容冲突仍是 `409`，包内重复或
+  非法修订仍是 `422`，二者都不写入；启动方式与环境变量不变
+  （仍为 `docker compose up --build` 或 `uvicorn app.main:app`）。
+- **升级无需迁移步骤**：服务首次以新版打开旧版 SQLite 数据库时，会在
+  启动事务内自动把已落盘的旧指纹（`idempotency_keys.canonical` 与
+  `packages.canonical`，均由 `events` 表中的完整修订内容重算）重写为新
+  格式；该升级幂等，可被多个 worker 并发执行。升级前已保存的修订、
+  幂等键映射与包记录在重启/多进程下继续正确判重与回放。
+
+调用示例（ID 与单位刻意包含 `|`，旧实现会误报重复，新版正确区分）：
+
+```bash
+# 提交一条 sensor_id 含分隔符的修订 -> accepted
+curl -s -X POST localhost:8080/api/v1/batches/B42/events \
+  -H 'Content-Type: application/json' \
+  -d '{"batch_id":"B42","sensor_id":"S|X","revision_id":"R","parent_id":"ROOT",
+       "idempotency_key":"K","start_ns":0,"end_ns":100,"value":1.0,"unit":"C"}'
+#   -> {"status":"accepted", ...}
+
+# 同一幂等键、字段取值跨分隔符“重新切分”的不同修订 -> 409，不写入
+curl -s -i -X POST localhost:8080/api/v1/batches/B42/events \
+  -H 'Content-Type: application/json' \
+  -d '{"batch_id":"B42","sensor_id":"S","revision_id":"X|R","parent_id":"ROOT",
+       "idempotency_key":"K","start_ns":0,"end_ns":100,"value":1.0,"unit":"C"}'
+#   -> HTTP/1.1 409 Conflict
+#      {"detail":"idempotency_key 'K' was already used with a different event payload"}
+
+# 预览同样区分：上面的不同内容预览即 409；完全相同内容的预览是 duplicate
+curl -s -X POST localhost:8080/api/v1/batches/B42/events:preview \
+  -H 'Content-Type: application/json' \
+  -d '{"batch_id":"B42","sensor_id":"S|X","revision_id":"R","parent_id":"ROOT",
+       "idempotency_key":"K","start_ns":0,"end_ns":100,"value":1.0,"unit":"C"}'
+#   -> {"status":"duplicate", ...}
+
+# 完全相同内容原样重试 -> 仍是原有 duplicate 结果
+curl -s -X POST localhost:8080/api/v1/batches/B42/events \
+  -H 'Content-Type: application/json' \
+  -d '{"batch_id":"B42","sensor_id":"S|X","revision_id":"R","parent_id":"ROOT",
+       "idempotency_key":"K","start_ns":0,"end_ns":100,"value":1.0,"unit":"C"}'
+#   -> {"status":"duplicate", ...}
+```
+
+整包示例（顺序无关、换键/改字段/增删修订即冲突、非法仍 422）：
+
+```bash
+# 首次整包（子版本先列出）-> accepted
+curl -s -X POST localhost:8080/api/v1/batches/B77/packages \
+  -H 'Content-Type: application/json' \
+  -d '{"batch_id":"B77","package_id":"P1","revisions":[
+        {"sensor_id":"S1","revision_id":"v2","parent_id":"v1","idempotency_key":"e2",
+         "start_ns":100,"end_ns":200,"value":3.5,"unit":"C"},
+        {"sensor_id":"S1","revision_id":"v1","parent_id":"ROOT","idempotency_key":"e1",
+         "start_ns":0,"end_ns":300,"value":1.0,"unit":"C"}]}'
+#   -> {"status":"accepted", ...}
+
+# 仅调换列出顺序的完全相同内容重试 -> 回放首次保存的结果
+curl -s -X POST localhost:8080/api/v1/batches/B77/packages \
+  -H 'Content-Type: application/json' \
+  -d '{"batch_id":"B77","package_id":"P1","revisions":[
+        {"sensor_id":"S1","revision_id":"v1","parent_id":"ROOT","idempotency_key":"e1",
+         "start_ns":0,"end_ns":300,"value":1.0,"unit":"C"},
+        {"sensor_id":"S1","revision_id":"v2","parent_id":"v1","idempotency_key":"e2",
+         "start_ns":100,"end_ns":200,"value":3.5,"unit":"C"}]}'
+#   -> {"status":"duplicate", "result": { …首次保存的批次结果… }}
+
+# 同包号换幂等键（或改任何字段、增删修订）-> 409，不写入
+curl -s -o /dev/null -w '%{http_code}\n' -X POST \
+  localhost:8080/api/v1/batches/B77/packages -H 'Content-Type: application/json' \
+  -d '{"batch_id":"B77","package_id":"P1","revisions":[
+        {"sensor_id":"S1","revision_id":"v1","parent_id":"ROOT","idempotency_key":"eX",
+         "start_ns":0,"end_ns":300,"value":1.0,"unit":"C"}]}'
+#   -> 409
+
+# 包内非法修订（end_ns <= start_ns）-> 422，不写入
+curl -s -o /dev/null -w '%{http_code}\n' -X POST \
+  localhost:8080/api/v1/batches/B77/packages -H 'Content-Type: application/json' \
+  -d '{"batch_id":"B77","package_id":"P2","revisions":[
+        {"sensor_id":"S1","revision_id":"v1","parent_id":"ROOT","idempotency_key":"a",
+         "start_ns":0,"end_ns":0,"value":1.0,"unit":"C"}]}'
+#   -> 422
+```
+
+服务重启后（或请求落到另一个 worker）上述判等与回放结果保持一致；
+`/health` 输出版本为 `2.2.0`：
+
+```json
+{"status": "ok", "storage": "sqlite", "version": "2.2.0"}
+```
+
+---
+
 ## 6. 项目结构
 
 ```
@@ -1162,7 +1283,7 @@ curl -s localhost:8080/health
 │   ├── storage.py    # 两种同构后端：线程安全的内存 EventStore 与持久化/多进程共享的 SqliteEventStore（WAL + BEGIN IMMEDIATE 跨进程事务），幂等判定、无副作用预览判定、不可改写封存记录、整包回传记录与存储故障 StorageError
 │   ├── models.py     # Pydantic 请求/响应模型与校验
 │   └── config.py     # CAL_ 前缀环境变量配置（CAL_STORAGE / CAL_SQLITE_PATH / CAL_SQLITE_BUSY_TIMEOUT_MS）
-├── tests/            # pytest（API 端到端 + 引擎单测 + SQLite 持久化/重启/跨进程/存储故障，共 229 个用例）
+├── tests/            # pytest（API 端到端 + 引擎单测 + SQLite 持久化/重启/跨进程/存储故障，共 242 个用例）
 ├── Dockerfile
 ├── docker-compose.yml  # 双 worker + 命名卷 calibration-data 共享 SQLite 数据库
 ├── requirements.txt
